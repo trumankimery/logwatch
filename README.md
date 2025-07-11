@@ -86,20 +86,6 @@ This works on:
 
 ---
 
-## 🛠 Example: Monitor Auth Log
-
-```bash
-logwatch /var/log/auth.log "invalid user" --alert
-```
-
-Monitor multiple patterns:
-
-```bash
-logwatch /var/log/syslog "segfault" "OOM" "kernel panic" --ignore-case
-```
-
----
-
 ## 📄 License
 
 This project is licensed under the MIT License. See [`LICENSE`](LICENSE) for full details.
