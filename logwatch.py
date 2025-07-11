@@ -12,34 +12,35 @@ Features:
 
 Usage:
 ------
-  python logwatch.py /var/log/auth.log "failed login" "invalid user" --initial-report --alert
+    python logwatch.py /var/log/auth.log "failed login" "invalid user" --initial-report --alert
 
 Arguments:
 ----------
-  file (str): Path to the log file to monitor.
-  keywords (str...): One or more keywords to search for in the log lines.
+    file (str): Path to the log file to monitor.
+    keywords (str...): One or more keywords to search for in the log lines.
 
 Optional Flags:
 ---------------
-  -i, --ignore-case         : Perform case-insensitive matching.
-  --initial-report          : Run a one-time scan of the full file before live monitoring.
-  --report-file <filename>  : Save the results of the initial scan to this file.
-  --alert                   : Trigger desktop notification on new matching lines (requires `plyer`).
+    -i, --ignore-case         : Perform case-insensitive matching.
+    --initial-report          : Run a one-time scan of the full file before live monitoring.
+    --report-file <filename>  : Save the results of the initial scan to this file.
+    --alert                   : Trigger desktop notification on new matching lines (requires `plyer`).
 
 Dependencies:
 -------------
-- plyer (optional, only needed for desktop notifications)
-  Install with: pip install plyer
+    - plyer (optional, only needed for desktop notifications)
+      Install with: pip install plyer
 
 Author:
 -------
-Truman Kimery & ChatGPT (OpenAI)
+    Truman Kimery
 """
 
-import os
 import re
 import time
 import argparse
+from pathlib import Path
+import os  # Needed for SEEK_END and fstat()
 
 try:
     from plyer import notification
@@ -48,25 +49,32 @@ except ImportError:
 
 
 def scan_initial_log(file_path, pattern, report_file=None):
-    """Scan the full log file and report lines that match the keyword pattern.
+    """
+    Perform a one-time full scan of the log file and report lines matching the keyword pattern.
 
     Args:
-        file_path (str): Path to the log file.
-        pattern (re.Pattern): Compiled regex pattern of keywords.
-        report_file (str, optional): If provided, write matches to this file.
+        file_path (str): Path to the log file to scan.
+        pattern (re.Pattern): Compiled regex pattern to search for in each line.
+        report_file (str, optional): If provided, matched lines are written to this file.
+
+    Raises:
+        FileNotFoundError: If the log file does not exist.
+        PermissionError: If access to the file is denied.
     """
     print("[*] Running initial log scan...")
     matches = []
+    log_path = Path(file_path)
 
     try:
-        with open(file_path, "r") as f:
+        with log_path.open("r") as f:
             for line in f:
                 if pattern.search(line):
                     matches.append(line)
                     print(line, end="")
 
         if report_file:
-            with open(report_file, "w") as out:
+            report_path = Path(report_file)
+            with report_path.open("w") as out:
                 out.writelines(matches)
             print(f"[+] Report written to {report_file}")
 
@@ -79,69 +87,85 @@ def scan_initial_log(file_path, pattern, report_file=None):
 
 
 def watch_log(file_path, pattern, alert=False):
-    """Watch the log file for new lines matching the pattern, with cross-platform rotation support.
+    """
+    Continuously monitor a log file for new lines matching a regex pattern.
+
+    Automatically detects log rotation (via inode or mtime/size checks)
+    and reopens the file to resume monitoring.
 
     Args:
-        file_path (str): Path to the log file.
-        pattern (re.Pattern): Compiled regex pattern of keywords.
-        alert (bool): Whether to trigger desktop notifications on matches.
+        file_path (str): Path to the log file to monitor.
+        pattern (re.Pattern): Compiled regex pattern to search for in new lines.
+        alert (bool): If True, trigger a desktop notification on matching lines.
+
+    Raises:
+        FileNotFoundError: If the file does not exist when starting.
+        PermissionError: If read permissions are denied.
     """
+    log_path = Path(file_path)
+
     def open_log():
-        f = open(file_path, "r")
+        """
+        Open the log file for reading and seek to the end.
+
+        Returns:
+            Tuple[file, int|None, float, int]: The file object, inode (if available),
+                                               modification time, and size.
+        """
+        print("[*] Running Ongoing log scan...")
+        f = log_path.open("r")
         f.seek(0, os.SEEK_END)
         stat = os.fstat(f.fileno())
         inode = getattr(stat, "st_ino", None)
-        mtime = os.path.getmtime(file_path)
-        size = os.path.getsize(file_path)
+        mtime = log_path.stat().st_mtime
+        size = log_path.stat().st_size
         return f, inode, mtime, size
 
     try:
         f, last_inode, last_mtime, last_size = open_log()
+        with f:
+            while True:
+                line = f.readline()
 
-        while True:
-            line = f.readline()
+                if not line:
+                    time.sleep(0.1)
+                    try:
+                        stat = log_path.stat()
+                        current_inode = getattr(stat, "st_ino", None)
+                        current_mtime = stat.st_mtime
+                        current_size = stat.st_size
 
-            if not line:
-                time.sleep(0.1)
-                try:
-                    stat = os.stat(file_path)
-                    current_inode = getattr(stat, "st_ino", None)
-                    current_mtime = stat.st_mtime
-                    current_size = stat.st_size
+                        rotated = False
+                        if current_inode and current_inode != last_inode:
+                            rotated = True
+                        elif current_size < last_size and current_mtime <= last_mtime:
+                            rotated = True
 
-                    rotated = False
+                        if rotated:
+                            print("[*] Log file rotated or truncated. Reopening...")
+                            f.close()
+                            f, last_inode, last_mtime, last_size = open_log()
+                            f.__enter__()  # Re-enter context manager manually
+                        else:
+                            last_mtime = current_mtime
+                            last_size = current_size
 
-                    # Linux/macOS: inode check
-                    if current_inode and current_inode != last_inode:
-                        rotated = True
-                    # Windows fallback: file size shrank and timestamp reversed
-                    elif current_size < last_size and current_mtime <= last_mtime:
-                        rotated = True
+                    except FileNotFoundError:
+                        print("[!] Log file temporarily missing. Waiting...")
+                        time.sleep(1)
+                    continue
 
-                    if rotated:
-                        print("[*] Log file rotated or truncated. Reopening...")
-                        f.close()
-                        f, last_inode, last_mtime, last_size = open_log()
-                    else:
-                        last_mtime = current_mtime
-                        last_size = current_size
-
-                except FileNotFoundError:
-                    print("[!] Log file temporarily missing. Waiting...")
-                    time.sleep(1)
-                continue
-
-            if pattern.search(line):
-                print(line, end="")
-                if alert:
-                    if notification:
-                        notification.notify(
-                            title="Log Alert",
-                            message=line.strip()[:200],
-                            timeout=5
-                        )
-                    else:
-                        print("[!] Alert requested, but 'plyer' is not installed.")
+                if pattern.search(line):
+                    print(line, end="")
+                    if alert:
+                        if notification:
+                            notification.notify(
+                                title="Log Alert",
+                                message=line.strip()[:200],
+                                timeout=5
+                            )
+                        else:
+                            print("[!] Alert requested, but 'plyer' is not installed.")
 
     except KeyboardInterrupt:
         print("\n[INFO] Monitoring stopped by user.")
@@ -154,7 +178,12 @@ def watch_log(file_path, pattern, alert=False):
 
 
 def parse_args():
-    """Parse command-line arguments."""
+    """
+    Parse and return the command-line arguments.
+
+    Returns:
+        argparse.Namespace: The parsed arguments from the CLI.
+    """
     parser = argparse.ArgumentParser(
         description="Watch a log file for keywords and optionally alert or report matches."
     )
@@ -172,8 +201,11 @@ def parse_args():
 
 
 def main():
+    """
+    Entry point of the script. Parses arguments, compiles search pattern,
+    performs optional initial scan, then begins live monitoring.
+    """
     args = parse_args()
-
     flags = re.IGNORECASE if args.ignore_case else 0
     pattern = re.compile("|".join(re.escape(k) for k in args.keywords), flags)
 
